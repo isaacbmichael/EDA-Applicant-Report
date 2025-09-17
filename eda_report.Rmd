@@ -1,0 +1,1443 @@
+---
+title: "Applicant Insights Report - Descriptive Analytics"
+author: "Isaac B. Michael"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: readable
+---
+
+
+<style>
+body {
+  font-family: "Georgia", serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+h1, h2, h3, h4 {
+  font-family: "Helvetica Neue", Arial, sans-serif;
+  font-weight: bold;
+}
+code, pre {
+  font-family: "Courier New", monospace;
+}
+</style>
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(knitr)
+library(lubridate)
+library(DT)
+library(readr)
+library(dplyr)
+library(stringr)
+library(fuzzyjoin)
+library(tidyr)
+library(janitor)
+library(ggplot2)
+library(maps)
+library(scales)
+library(ggrepel)
+library(forcats)
+```
+
+---
+
+# 1. Introduction  
+
+This report provides a **descriptive analytics overview** of applications to a **national STEM enrichment program**. It summarizes applicant demographics, school types, geographic reach, referral sources, and enrollment patterns.  
+
+**Years analyzed:** 2022–present  
+
+The purpose of this report is to:  
+
+- **Understand** who is applying and enrolling  
+- **Track** trends year over year  
+- **Identify** key markets and referral sources to guide **future outreach and advertising**  
+
+## 1.1 Data Sources  
+
+This report combines both **internal program data** (applicant spreadsheets) and **external contextual data** (school directories and Census data).  
+ 
+### 1.1.1 Internal Sources  
+Applicant spreadsheets submitted via registration (**Excel format**). The following annual applicant files are below:
+
+```{r files_present, echo=FALSE}
+list.files(pattern = "^applicants_\\d{4}\\.xlsx$", ignore.case = TRUE)
+```
+
+Each year, new annual files (e.g. `applicants_2027.xlsx`) will be added to the same folder. This report will **use all available years** and update the results when re-knit.   
+
+### 1.1.2 External Sources  
+
+NCES Common Core of Data (CCD) – Public/Charter School Directory  
+- **Source:** [NCES CCD](https://nces.ed.gov/ccd/pubschuniv.asp)  
+- **Example file used:** `ccd1819.csv`  
+
+NCES Private School Survey (PSS) – Private School Directory  
+- **Source:** [NCES PSS](https://nces.ed.gov/surveys/pss/)  
+- **Example file used:** `pss2122.csv`  
+
+U.S. Census Bureau, American Community Survey (ACS) – Median Household Income by ZIP Code Tabulation Area (Table B19013)  
+- **Source:** [data.census.gov](https://data.census.gov/)  
+- **Example file used:** `acs22.csv`  
+
+---
+
+# 2. Data Preparation  
+
+In this section, we detail the steps taken to clean, harmonize, and enrich the raw applicant data in preparation for analysis. 
+
+Processes included consolidating internal application files, joining external datasets (NCES school directories, ACS income data), normalizing variables, and applying quality checks to ensure consistency.  
+
+## 2.1 Overview
+
+We begin by summarizing the size of each applicant dataset (number of observations and variables).  
+
+```{r dataset_summary, echo=FALSE}
+# List all applicant files
+files <- list.files(pattern = "^applicants_\\d{4}\\.xlsx$", ignore.case = TRUE)
+
+# Function: read one file and return counts
+summarize_file <- function(f) {
+  yr <- readr::parse_number(f)
+  dat <- readxl::read_excel(f) %>% janitor::clean_names()
+  tibble(
+    year = yr,
+    file = f,
+    observations = nrow(dat),
+    variables = ncol(dat)
+  )
+}
+
+# Apply to all files and bind into one table
+summary_tbl <- purrr::map_dfr(files, summarize_file)
+
+knitr::kable(summary_tbl, caption = "Observations and Variables per Year")
+```
+
+## 2.2 Variable Comparison by Year 
+
+This will show you if the same variables exist consistently or if some need renaming.  
+
+```{r compare_columns, echo=FALSE}
+# Read all files into a named list and clean names
+datasets <- purrr::map(files, ~ readxl::read_excel(.x) %>% janitor::clean_names())
+names(datasets) <- readr::parse_number(files)
+
+# Build presence table
+presence <- tibble::tibble(variable = unique(unlist(purrr::map(datasets, names))))
+for (yr in names(datasets)) {
+  presence[[paste0("in_", yr)]] <- presence$variable %in% names(datasets[[yr]])
+}
+
+# Interactive table
+DT::datatable(
+  presence %>% dplyr::arrange(variable),
+  options = list(scrollX = TRUE, pageLength = 15, autoWidth = TRUE),
+  caption = "Variable presence by year (interactive)"
+)
+```
+
+
+## 2.3 Standardize Data
+
+To ensure consistency across multiple application years, we performed a set of cleaning and harmonization steps before analysis.
+
+
+- **Name and Location Fields**: Student names, home cities, and school cities were converted to title case for readability. State values were normalized so that both full state names and abbreviations map to standard USPS two-letter codes (e.g., "Georgia" → "GA"). Extra whitespace was trimmed throughout.  
+
+- **Cross-Year Schema Alignment**: Application forms used different column names in different years (e.g., “student_email_address” vs. “student_e_mail_address”). We mapped these variations into a unified schema that includes email, phone, demographics, home/school address, grade, referral source, needs-based aid, payment, and completion status.  
+
+- **Session and Financial Aid**: Free-text session choices were standardized into Session 1 or Session 2. Financial need was captured from either a written explanation or uploaded documentation, producing a unified `needs_based` flag.  
+
+- **Payments**: Payment fields were cleaned, tuition values joined by year, and a boolean `paid` flag was derived based on payment status text and amounts.  
+
+The result is a combined dataset (`apps_all`) covering all application years, and a streamlined analysis dataset (`apps_core`) containing harmonized identifiers, demographics, addresses, school details, referral sources, financial aid, payments, and program outcomes.  
+
+**Note:** Detailed cleaning code is omitted here for readability.  
+
+```{r harmonize_all_years, echo=FALSE}
+# --- helpers ---------------------------------------------------------------
+clean_phone <- function(x) {
+  # keep only digits; return "" if NA
+  d <- gsub("[^0-9]", "", as.character(x))
+  ifelse(is.na(d), "", d)
+}
+
+# Robust date parser: handles Date, POSIXct, character (YMD/MDY/DMY), and Excel serials
+parse_any_date <- function(x){
+  if (inherits(x, "Date"))   return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  if (is.numeric(x))         return(as.Date(x, origin = "1899-12-30"))  # Excel serial dates
+  y <- suppressWarnings(lubridate::ymd(x))
+  if (all(is.na(y))) y <- suppressWarnings(lubridate::mdy(x))
+  if (all(is.na(y))) y <- suppressWarnings(lubridate::dmy(x))
+  as.Date(y)
+}
+
+# coalesce across any of the candidate names that exist in a given df
+co_fun <- function(df, candidates){
+  keep <- intersect(names(df), candidates)
+  if (length(keep) == 0) return(rlang::expr(NA))
+  rlang::expr(dplyr::coalesce(!!!rlang::syms(keep)))
+}
+
+# TRUE if any non-empty string (used for uploads/verification)
+has_any <- function(x){
+  y <- as.character(x)
+  ifelse(!is.na(y) & trimws(y) != "", TRUE, FALSE)
+}
+
+# Add Session
+parse_session <- function(x){
+  s <- tolower(stringr::str_squish(as.character(x)))
+  has1 <- stringr::str_detect(s, "\\b1\\b|session\\s*1|first|s1")
+  has2 <- stringr::str_detect(s, "\\b2\\b|session\\s*2|second|s2")
+  dplyr::case_when(
+    has1 & !has2 ~ 1L,
+    has2 & !has1 ~ 2L,
+    TRUE         ~ NA_integer_      # both/none/unclear -> NA
+  )
+}
+
+# --- per-file harmonizer ---------------------------------------------------
+harmonize_cols <- function(df){
+  df %>%
+    dplyr::mutate(
+      # Student identity & contact
+      student_email     = !!co_fun(df, c("student_email_address","student_e_mail_address")),
+      student_phone_raw = !!co_fun(df, c("student_cell_number","student_phone_number","confirm_student_cell_number")),
+      student_fname     = !!co_fun(df, c("student_name_first","preferred_name_or_nickname")),
+      student_lname     = !!co_fun(df, c("student_name_last")),
+
+      # Demographics
+      gender_unified    = !!co_fun(df, c("gender","sex")),
+      race_ethnicity    = !!co_fun(df, c("race_ethnicity")),
+      date_of_birth     = !!co_fun(df, c("date_of_birth")),
+
+      # Home / mailing address (2022: address_*; 2023+: current_postal_address_*)
+      home_address1     = !!co_fun(df, c("address_address","current_postal_address_address")),
+      home_address2     = !!co_fun(df, c("address_address2","current_postal_address_address2")),
+      home_city         = !!co_fun(df, c("address_city","current_postal_address_city")),
+      home_state        = !!co_fun(df, c("address_state","current_postal_address_state")),
+      home_zip          = !!co_fun(df, c("address_zip","current_postal_address_zip")),
+      home_country      = !!co_fun(df, c("address_country","current_postal_address_country")),
+
+      # School info (2022: school_currently_attending_*; 2023+: location_of_school_*)
+      school_name       = !!co_fun(df, c("school_currently_attending")),
+      school_address1   = !!co_fun(df, c("school_currently_attending_address","location_of_school_address")),
+      school_address2   = !!co_fun(df, c("school_currently_attending_address2","location_of_school_address2")),
+      school_city       = !!co_fun(df, c("school_currently_attending_city","location_of_school_city")),
+      school_state      = !!co_fun(df, c("school_currently_attending_state","location_of_school_state")),
+      school_zip        = !!co_fun(df, c("school_currently_attending_zip","location_of_school_zip")),
+      school_country    = !!co_fun(df, c("school_currently_attending_country","location_of_school_country")),
+
+      # Grade (year-specific question text)
+      grade_raw = !!co_fun(df, c(
+        "grade_in_21_22",
+        "what_will_your_high_school_grade_level_be_in_2023_2024",
+        "what_will_your_high_school_grade_level_be_in_2024_2025",
+        "what_will_your_high_school_grade_level_be_in_2025_2026"
+      )),
+      
+      # Referral source
+      referral          = !!co_fun(df, c("how_did_you_hear_about_us","how_did_you_find_us")),
+
+      # --- Session (numeric: 1 or 2) ---------------------------------------
+      session_text  = !!co_fun(df, c(
+        "which_math_research_session_would_you_like_to_attend",     # 2022
+        "for_which_research_session_are_you_registering"           # 2023–2025
+      )),
+      session_clean = stringr::str_squish(
+        stringr::str_replace_all(tolower(as.character(session_text)), "\u00A0", " ")
+      ),
+      session = dplyr::case_when(
+        stringr::str_detect(session_clean, "\\bsession\\s*1\\b") ~ 1L,
+        stringr::str_detect(session_clean, "\\bsession\\s*2\\b") ~ 2L,
+        stringr::str_detect(session_clean, "june\\s*13|july\\s*2\\b") ~ 1L,   # 2022 phrasing
+        stringr::str_detect(session_clean, "july\\s*18|aug(ust)?\\s*6\\b") ~ 2L,
+        TRUE ~ NA_integer_
+      ),
+
+      # Financial need (reason text vs. verification upload)
+      need_reason_raw   = !!co_fun(df, c("reason_for_financial_need")),
+      need_verif_raw    = !!co_fun(df, c("financial_need_verification")),
+      need_doc_uploaded = has_any(!!co_fun(df, c("financial_need_verification"))),
+      needs_based       = dplyr::case_when(
+        has_any(!!co_fun(df, c("reason_for_financial_need"))) ~ TRUE,
+        need_doc_uploaded ~ TRUE,
+        TRUE ~ FALSE
+      ),
+
+      # Payments
+      payment_status    = !!co_fun(df, c("payment_status")),
+      amount_due        = !!co_fun(df, c("due_now","total_fee")),
+      amount_paid_raw   = !!co_fun(df, c("card_amount")),
+      
+      # Program completion
+      completed_program = !!co_fun(df, c("completed_program"))
+
+    )
+}
+
+
+# --- read all, harmonize, and clean ---------------------------------------
+read_one <- function(f){
+  yr <- readr::parse_number(f)
+  readxl::read_excel(f) %>%
+    janitor::clean_names() %>%
+    harmonize_cols() %>%
+    dplyr::mutate(
+      year = yr,
+      # ensure consistent Date type before binding
+      date_of_birth = parse_any_date(date_of_birth)
+    )
+}
+
+# tuition table (update if/when tuition changes)
+tuition_table <- tibble::tibble(
+  year    = c(2022, 2023, 2024, 2025),
+  tuition = c(895,   1200, 1200, 1200)
+)
+
+apps_all <- purrr::map_dfr(files, read_one) %>%
+  dplyr::mutate(
+    home_state   = stringr::str_to_upper(as.character(home_state)),
+    school_state = stringr::str_to_upper(as.character(school_state)),
+    grade        = readr::parse_number(as.character(grade_raw)),
+    referral     = stringr::str_squish(as.character(referral)),
+    amount_paid  = suppressWarnings(as.numeric(amount_paid_raw)),
+    payment_status_txt = tolower(stringr::str_squish(as.character(payment_status)))
+  ) %>%
+  dplyr::left_join(tuition_table, by = "year") %>%
+  dplyr::mutate(
+    paid = dplyr::case_when(
+      stringr::str_detect(payment_status_txt, "paid|complete|confirm") ~ TRUE,
+      stringr::str_detect(payment_status_txt, "unpaid|pending|no|declined|incomplete") ~ FALSE,
+      !is.na(amount_paid) & !is.na(tuition) & amount_paid >= tuition ~ TRUE,
+      TRUE ~ NA
+    ),
+    student_phone = clean_phone(student_phone_raw),
+    
+    # Add formatted string columns
+    tuition_fmt = scales::dollar(tuition, accuracy = 1),
+    amount_paid_fmt = scales::dollar(amount_paid, accuracy = 1),
+  )
+
+# --- trimmed analysis dataset ---------------------------------------------
+apps_core <- apps_all %>%
+  dplyr::select(
+    year, tuition,
+    student_fname, student_lname, student_email, student_phone,
+    gender_unified, race_ethnicity, date_of_birth, grade,
+    home_city, home_state, home_zip, home_country,
+    school_name, school_city, school_state, school_zip,
+    referral, session,
+    needs_based, need_doc_uploaded, need_reason_raw,
+    payment_status, paid, amount_due, amount_paid,
+    completed_program 
+  )
+```
+
+
+```{r step3_standardize_text, echo=FALSE}
+# --- helpers ---------------------------------------------------------------
+to_title <- function(x) {
+  y <- stringr::str_squish(as.character(x))
+  y <- tolower(y)
+  tools::toTitleCase(y)
+}
+
+state_map <- tibble::tibble(
+  name = toupper(c(state.name, "DISTRICT OF COLUMBIA")),
+  abbr = c(state.abb, "DC")
+)
+
+normalize_state <- function(x){
+  y <- toupper(stringr::str_squish(as.character(x)))
+  dplyr::case_when(
+    y %in% state_map$name ~ state_map$abbr[match(y, state_map$name)],
+    y %in% toupper(state.abb) ~ y,
+    TRUE ~ y
+  )
+}
+
+# --- apply standardization -------------------------------------------------
+apps_core <- apps_core %>%
+  dplyr::mutate(
+    student_fname   = to_title(student_fname),
+    student_lname   = to_title(student_lname),
+    home_city       = to_title(home_city),
+    school_city     = to_title(school_city),
+    home_state      = normalize_state(home_state),
+    school_state    = normalize_state(school_state),
+    referral        = stringr::str_squish(referral),
+    need_reason_raw = stringr::str_squish(need_reason_raw),
+
+    # 🔧 NEW: clean race/ethnicity values
+    race_ethnicity = stringr::str_squish(race_ethnicity),   # remove whitespace
+    race_ethnicity = stringr::str_to_title(race_ethnicity), # consistent casing
+    race_ethnicity = dplyr::case_when(
+      str_detect(tolower(race_ethnicity), "asian") ~ "Asian",
+      str_detect(tolower(race_ethnicity), "hispanic|latino") ~ "Hispanic or Latino",
+      str_detect(tolower(race_ethnicity), "black|african") ~ "Black or African American",
+      str_detect(tolower(race_ethnicity), "white") ~ "White",
+      str_detect(tolower(race_ethnicity), "middle eastern") ~ "Middle Eastern",
+      str_detect(tolower(race_ethnicity), "chinese") ~ "Asian",
+      str_detect(tolower(race_ethnicity), "prefer not") ~ "Prefer not to answer",
+      TRUE ~ race_ethnicity   # leave as-is if uncaught
+    ),
+
+    # manual fix for unique case
+    student_fname = dplyr::case_when(
+      student_fname == "can" ~ "Can",
+      TRUE ~ student_fname
+    )
+  )
+```
+
+
+## 2.4 Duplicate Check
+
+We check for and remove duplicate records using the following rules:
+
+- We de-dupe **within each year** (cross-year repeats are returning students and are kept).
+- Prefer the record that looks “most complete / most paid”.
+- Primary key is **email** (lowercased/trimmed); if that’s missing, fall back to **name + DOB**.
+
+
+```{r dedupe_build, echo=FALSE}
+# Build a de-duplication key based on email, or fallback to name + DOB
+apps_core_nodup <- apps_core %>%
+  dplyr::mutate(
+    email_key = tolower(stringr::str_squish(student_email)),
+    fname_key = stringr::str_to_lower(stringr::str_squish(student_fname)),
+    lname_key = stringr::str_to_lower(stringr::str_squish(student_lname)),
+    dob_key   = date_of_birth,
+    dedup_key = dplyr::coalesce(
+      dplyr::na_if(email_key, ""),
+      paste(fname_key, lname_key, dob_key, sep = "|")
+    ),
+    # Score: prefer paid/amount info, then other completeness fields
+    complete_score = (paid %in% TRUE) +
+                     (!is.na(amount_paid)) + (!is.na(payment_status)) +
+                     (!is.na(student_phone)) + (!is.na(referral)) +
+                     (!is.na(home_city)) + (!is.na(school_name))
+  ) %>%
+  # IMPORTANT: dedupe within (year, session, dedup_key)
+  dplyr::group_by(year, session, dedup_key) %>%
+  dplyr::slice_max(complete_score, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-email_key, -fname_key, -lname_key, -dob_key, -dedup_key, -complete_score)
+
+# Before/after counts per year & session
+dedupe_summary <- dplyr::full_join(
+  apps_core %>% dplyr::count(year, session, name = "n_before"),
+  apps_core_nodup %>% dplyr::count(year, session, name = "n_after"),
+  by = c("year","session")
+) %>%
+  dplyr::mutate(removed = n_before - n_after) %>%
+  dplyr::arrange(year, session)
+
+knitr::kable(dedupe_summary, caption = "De-duplication summary (within year + session)")
+
+# (Optional) sanity check: remaining dupes by (year, session, email) or (year, session, name+dob)
+dupe_check <- apps_core_nodup %>%
+  dplyr::mutate(
+    email_key = tolower(stringr::str_squish(student_email)),
+    name_dob  = paste(
+      stringr::str_to_lower(stringr::str_squish(student_fname)),
+      stringr::str_to_lower(stringr::str_squish(student_lname)),
+      date_of_birth, sep = "|"
+    )
+  ) %>%
+  dplyr::summarise(
+    dupes_by_email   = sum(duplicated(paste(year, session, email_key))),
+    dupes_by_namedob = sum(duplicated(paste(year, session, name_dob)))
+  )
+```
+
+
+## 2.5 School Classification 
+
+In order to better understand the types of schools our applicants are coming from, we classified each student’s school as **Public, Private, or Charter**. 
+
+This provides important context for evaluating outreach effectiveness and access across different school types.
+
+### 2.5.1 CCD and PSS Data
+
+We enhance the dataset by **classifying schools** using the NCES directories:  
+
+- **Public schools** → NCES *Common Core of Data (CCD)*  
+- **Private schools** → NCES *Private School Survey (PSS)*  
+
+**Process:**  
+
+1. Clean column names and extract a consistent set of fields:  
+   - `school_name`  
+   - `school_city`  
+   - `school_state`  
+   - `school_zip`  
+   - `nces_type`  
+   
+2. Combine CCD and PSS into a **unified lookup table**: `nces_schools`.  
+
+3. Join this lookup table with our applicant dataset (`apps_core_nodup`) to assign a new variable: `school_type`.  
+
+**Classification rules:**  
+
+- `"Public"` → if a CCD match is found  
+- `"Private"` → if a PSS match is found  
+- `"Charter"` → if detected in NCES data or keywords in name  
+- `"Private"` (fallback) → if keywords like *"Prep"*, *"Academy"*, *"Independent"* are found  
+- `"N/A"` → if no match or keyword detected  
+
+
+```{r school_type, echo=FALSE, eval=TRUE}
+# read your uploads (adjust filenames if needed)
+ccd <- readr::read_csv("ccd1819.csv")  %>% janitor::clean_names()
+pss <- readr::read_csv("pss2122.csv")  %>% janitor::clean_names()
+
+# helper: safely pick the first existing column name
+pick_first <- function(df, candidates, default = NA_character_) {
+  cols <- intersect(candidates, names(df))
+  if (length(cols) == 0) rep(default, nrow(df)) else df[[cols[1]]]
+}
+
+# slim CCD (public/charter). Column names vary a bit by year; we handle variants.
+ccd_slim <- ccd %>%
+  dplyr::mutate(
+    nces_name   = pick_first(., c("sch_name","school_name","schname")),
+    nces_city   = pick_first(., c("lcity","city","sch_city")),
+    nces_state  = toupper(pick_first(., c("state","stabbr","lstate","postal"))),
+    nces_zip    = pick_first(., c("lzip","zip","zip_code","zip5")),
+    charter_txt = pick_first(., c("charter_text","charter","ischart")),
+    nces_type_detail = dplyr::if_else(tolower(charter_txt) %in% c("yes","y","1","true"),
+                                      "Charter", "Public"),
+    nces_source = "CCD"
+  ) %>%
+  dplyr::select(nces_name, nces_city, nces_state, nces_zip, nces_type_detail, nces_source) %>%
+  dplyr::filter(!is.na(nces_name), !is.na(nces_state))
+
+# slim PSS (private)
+pss_slim <- pss %>%
+  dplyr::mutate(
+    nces_name        = pick_first(., c("sch_name","school_name","name")),
+    nces_city        = pick_first(., c("city")),
+    nces_state       = toupper(pick_first(., c("stabbr","state","postal"))),
+    nces_zip         = pick_first(., c("zip","zip_code","zip5")),
+    nces_type_detail = "Private",
+    nces_source      = "PSS"
+  ) %>%
+  dplyr::select(nces_name, nces_city, nces_state, nces_zip, nces_type_detail, nces_source) %>%
+  dplyr::filter(!is.na(nces_name), !is.na(nces_state))
+
+# unified directory used later
+nces_schools <- dplyr::bind_rows(ccd_slim, pss_slim)
+
+# --- helpers to normalize fields ---
+norm_zip5 <- function(x){
+  x <- gsub("[^0-9]", "", as.character(x))
+  dplyr::case_when(
+    nchar(x) >= 5 ~ substr(x, 1, 5),
+    nchar(x) == 0 ~ NA_character_,
+    TRUE          ~ stringr::str_pad(x, 5, pad = "0")
+  )
+}
+norm_name <- function(x){
+  x %>%
+    as.character() %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("[^a-z0-9 ]", " ") %>%
+    stringr::str_replace_all("\\b(st)\\.?\\b", "saint") %>%   # st. → saint
+    stringr::str_replace_all("\\bhs\\b", "high school") %>%
+    stringr::str_squish()
+}
+lc <- function(x) stringr::str_to_lower(stringr::str_squish(as.character(x)))
+uc <- function(x) toupper(stringr::str_squish(as.character(x)))
+
+# --- normalize applicants (US only for NCES match) ---
+apps_norm <- apps_core_nodup %>%
+  dplyr::mutate(
+    school_zip5   = dplyr::coalesce(norm_zip5(school_zip), norm_zip5(home_zip)),
+    school_name_n = norm_name(school_name),
+    school_city_n = lc(school_city),
+    school_state_n= uc(school_state),
+    is_us         = is.na(home_country) | lc(home_country) %in%
+                    c("united states","usa","us","u.s.","u.s.a.")
+  )
+
+# --- normalize NCES directory (pss + ccd) ---
+nces_dir <- nces_schools %>%
+  dplyr::transmute(
+    nces_name_n  = norm_name(nces_name),
+    nces_city_n  = lc(nces_city),
+    nces_state_n = uc(nces_state),
+    nces_zip5    = norm_zip5(nces_zip),
+    nces_type_detail,
+    nces_source
+  ) %>%
+  dplyr::filter(!is.na(nces_name_n), !is.na(nces_state_n))
+
+# PASS 1: exact on name+city+state+zip
+p1 <- apps_norm %>%
+  dplyr::filter(is_us) %>%
+  dplyr::inner_join(
+    nces_dir,
+    by = c("school_name_n"="nces_name_n",
+           "school_city_n"="nces_city_n",
+           "school_state_n"="nces_state_n",
+           "school_zip5"  ="nces_zip5")
+  ) %>%
+  dplyr::mutate(match_level = "name+city+state+zip")
+
+# PASS 2: exact on name+city+state (no zip)
+p2 <- apps_norm %>%
+  dplyr::filter(is_us) %>%
+  dplyr::anti_join(p1 %>% dplyr::select(dplyr::all_of(names(apps_norm))),
+                   by = names(apps_norm)) %>%
+  dplyr::inner_join(
+    nces_dir,
+    by = c("school_name_n"="nces_name_n",
+           "school_city_n"="nces_city_n",
+           "school_state_n"="nces_state_n")
+  ) %>%
+  dplyr::mutate(match_level = "name+city+state")
+
+# PASS 3: exact on name+state
+p3 <- apps_norm %>%
+  dplyr::filter(is_us) %>%
+  dplyr::anti_join(dplyr::bind_rows(
+                     p1 %>% dplyr::select(dplyr::all_of(names(apps_norm))),
+                     p2 %>% dplyr::select(dplyr::all_of(names(apps_norm)))
+                   ),
+                   by = names(apps_norm)) %>%
+  dplyr::inner_join(
+    nces_dir,
+    by = c("school_name_n"="nces_name_n",
+           "school_state_n"="nces_state_n")
+  ) %>%
+  dplyr::mutate(match_level = "name+state")
+
+# PASS 4: fuzzy on name within state (and city if present)
+remaining4 <- apps_norm %>%
+  dplyr::filter(is_us) %>%
+  dplyr::anti_join(dplyr::bind_rows(
+                     p1 %>% dplyr::select(dplyr::all_of(names(apps_norm))),
+                     p2 %>% dplyr::select(dplyr::all_of(names(apps_norm))),
+                     p3 %>% dplyr::select(dplyr::all_of(names(apps_norm)))
+                   ),
+                   by = names(apps_norm)) %>%
+  dplyr::mutate(row_id = dplyr::row_number())
+
+p4 <- remaining4 %>%
+  fuzzyjoin::stringdist_left_join(
+    nces_dir,
+    by = c("school_name_n" = "nces_name_n"),
+    method = "jw",
+    max_dist = 0.08,           # 1 - 0.92 similarity threshold
+    distance_col = "dist"      # <— name the distance column explicitly
+  ) %>%
+  dplyr::filter(!is.na(nces_state_n),
+                school_state_n == nces_state_n,
+                is.na(school_city_n) | is.na(nces_city_n) | school_city_n == nces_city_n) %>%
+  dplyr::group_by(row_id) %>%
+  dplyr::slice_min(dist, n = 1, with_ties = FALSE) %>%   # <— use 'dist' here
+  dplyr::ungroup() %>%
+  dplyr::mutate(match_level = "fuzzy(name)+state")
+
+
+# combine passes
+matched <- dplyr::bind_rows(p1, p2, p3, p4) %>%
+  dplyr::select(dplyr::all_of(names(apps_norm)), nces_type_detail, nces_source, match_level) %>%
+  dplyr::distinct()
+
+apps_core_nodup <- apps_norm %>%
+  dplyr::left_join(matched, by = names(apps_norm)) %>%
+  dplyr::mutate(
+    school_type = dplyr::case_when(
+      !is.na(nces_type_detail) ~ nces_type_detail,
+      stringr::str_detect(stringr::str_to_lower(dplyr::coalesce(school_name, "")), "\\bcharter\\b") ~ "Charter",
+      stringr::str_detect(stringr::str_to_lower(dplyr::coalesce(school_name, "")), "academy|prep|independent|grammar|parochial|christian|catholic|montessori") ~ "Private",
+      stringr::str_detect(stringr::str_to_lower(dplyr::coalesce(school_name, "")), "high school|public|\\bhs\\b") ~ "Public",
+      TRUE ~ "N/A"
+    )
+  )
+
+# QA: how many matched at each pass?
+match_tbl <- apps_core_nodup %>%
+  dplyr::count(match_level = dplyr::coalesce(match_level, "no_match")) %>%
+  dplyr::mutate(pct = scales::percent(n / sum(n)))
+
+knitr::kable(match_tbl, caption = "NCES match breakdown (after progressive and fuzzy matching)")
+```
+
+### 2.5.2 Heuristics
+
+Because of this low direct match rate, we applied **keyword-based heuristics** as a fallback to classify unmatched schools.  
+
+For example:  
+
+- Names containing **"Academy"** or **"Prep"** → *Private*  
+- Names containing **"High School"** or **"Public"** → *Public*  
+- Names containing **"Charter"** → *Charter*  
+
+The final distribution of school types, after applying both NCES data and heuristics, is shown below:
+
+```{r heuristics, echo=FALSE}
+apps_core_nodup %>%
+  count(school_type, sort = TRUE) %>%
+  mutate(pct = scales::percent(n / sum(n))) %>%
+  knitr::kable(caption = "Final School Type Classification (NCES + heuristics)")
+```
+
+
+## 2.6 ZIP Code Socioeconomics
+
+To better understand the socioeconomic background of applicants, we enrich the dataset by linking each student’s home ZIP code to publicly available Census Bureau data.  
+
+Specifically, we use the **American Community Survey (ACS) 5-Year Estimates (2018–2022 release)**, Table **B19013**: *Median Household Income in the Past 12 Months*. The ACS 5-year dataset is chosen because it provides **stable, reliable estimates at small geographies** such as ZIP Code Tabulation Areas (ZCTAs), whereas 1-year estimates are not consistently available at the ZIP level and can be noisy due to small samples.  
+
+**Steps:**  
+
+- Normalize all student ZIP codes into standard 5-digit format.  
+- Join the applicant dataset with ACS median household income by ZCTA.  
+- Compute national quartiles of median ZIP incomes from ACS data.  
+- Categorize students into **socioeconomic tiers** based on the ZIP where they live:  
+  - **Low Income** → bottom 25% of ZIP codes  
+  - **Middle Income** → 25th–75th percentile ZIP codes  
+  - **High Income** → top 25% of ZIP codes  
+- If no ACS match is found, the SES value is set to **Unknown**.  
+
+**Important Notes:**  
+
+- This method classifies students by the **median income of their ZIP code area**, not by their individual household income. It should therefore be interpreted as a **proxy for neighborhood-level socioeconomic context**, not a precise measure of family resources.  
+- Percentile thresholds (25th = \$53,464; 75th = \$85,184) are based on the ACS 2018–2022 distribution and may differ from **national household income percentiles reported in CPS** surveys.  
+- As new ACS 5-year releases become available (e.g., 2019–2023), these benchmarks should be updated to reflect changes in the national income distribution.  
+ 
+```{r ZIP_Income, echo=FALSE}
+## Step 7 – ZIP → Income (ACS 2018–2022, B19013)
+
+# Helper: clean ZIP into 5-digit string
+norm_zip5 <- function(x){
+  x <- gsub("[^0-9]", "", as.character(x))
+  ifelse(nchar(x) >= 5, substr(x, 1, 5), NA)
+}
+
+# Read ACS 2018–2022 5-year data
+acs <- readr::read_csv("acs22.csv") %>%
+  janitor::clean_names()
+
+# Keep only ZIP (from NAME) and median household income (B19013_001e)
+acs_slim <- acs %>%
+  transmute(
+    zip = norm_zip5(gsub("ZCTA5 ", "", name)),  # strip prefix, keep 5 digits
+    median_income = suppressWarnings(as.numeric(b19013_001e))  # force numeric
+  ) %>%
+  filter(!is.na(zip), !is.na(median_income))
+
+# Calculate national cutoff points (25th and 75th percentiles)
+cutoffs <- quantile(acs_slim$median_income, probs = c(0.25, 0.75), na.rm = TRUE)
+
+cutoff_tbl <- tibble::tibble(
+  Category = c("Low Income", "Middle Income", "High Income"),
+  Income_Range = c(
+    paste0("≤ ", scales::dollar(cutoffs[1], accuracy = 1)),
+    paste0(scales::dollar(cutoffs[1], accuracy = 1), " – ", scales::dollar(cutoffs[2], accuracy = 1)),
+    paste0("≥ ", scales::dollar(cutoffs[2], accuracy = 1))
+  )
+)
+
+knitr::kable(cutoff_tbl, caption = "National Income Cutoffs (ACS 2018–2022, tercile grouping)")
+
+# Join to applicants
+apps_core_nodup <- apps_core_nodup %>%
+  mutate(home_zip5 = norm_zip5(home_zip)) %>%
+  left_join(acs_slim, by = c("home_zip5" = "zip"))
+
+# Assign SES categories
+apps_core_nodup <- apps_core_nodup %>%
+  mutate(
+    ses_label = case_when(
+      is.na(median_income) ~ "N/A",
+      median_income <= cutoffs[1] ~ "Low Income",
+      median_income <= cutoffs[2] ~ "Middle Income",
+      TRUE ~ "High Income"
+    )
+  )
+
+# Quick QA: SES distribution in our applicants
+apps_core_nodup %>%
+  count(ses_label) %>%
+  knitr::kable(caption = "Applicant SES Distribution (ACS 2018–2022 national terciles)")
+```
+
+
+## 2.7 Final Analytic Dataset
+
+Below is a preview of the **final cleaned analytic dataset**, `apps_core_nodup`, which now includes:  
+
+- Harmonized variables across years  
+- De-duplicated student records  
+- Completion status (`completed_program`)  
+- School type (Public / Private / Charter / Unknown)  
+- Socioeconomic status (`ses_label`) derived from ZIP → Census income  
+
+```{r n_total, echo=FALSE}
+n_total <- nrow(apps_core_nodup)
+n_total_fmt <- scales::comma(n_total)  # pretty formatting
+```
+
+The final analytic dataset contains **`r n_total_fmt`** student records after cleaning and de-duplication.
+
+```{r final_preview, echo=FALSE}
+# Safer preview table
+display_tbl <- apps_core_nodup %>%
+  dplyr::select(
+    year, tuition, gender_unified, race_ethnicity, grade,
+    home_state, school_type, session,
+    needs_based, paid, completed_program,
+    median_income, ses_label
+  ) %>%
+  dplyr::mutate(
+    tuition = ifelse(!is.na(tuition), scales::dollar(tuition, accuracy = 1), NA),
+    median_income = ifelse(!is.na(median_income), scales::dollar(median_income, accuracy = 1), NA)
+  )
+
+DT::datatable(
+  display_tbl,
+  options = list(scrollX = TRUE, pageLength = 5, autoWidth = TRUE),
+  caption = "Preview of Final Cleaned Analytic Dataset (PII removed)"
+)
+```
+
+---
+
+# 3. Exploratory Data Analysis
+
+Now that we have prepared and harmonized the applicant data, we move into the exploratory analysis phase.  
+The primary goal of this section is to **better understand who our applicants are and what factors influence participation** in the program.  
+ 
+Specifically, we want to answer questions such as:  
+
+- **Where do our students come from?** (Geographic and school-level patterns)  
+- **Who are they demographically?** (Gender, race/ethnicity, grade, age)  
+- **What are their socioeconomic backgrounds?** (ZIP-based income levels, needs-based applications)  
+- **How do academic backgrounds and school types differ?** (Public vs. private vs. charter schools)  
+- **Which recruitment channels are most effective?** (Referral sources and completion outcomes)  
+- **How has the applicant pool changed over time?** (Year-to-year trends)  
+
+Throughout this section, we will use **data visualizations** (bar charts, pie charts, histograms, maps, and line graphs) to highlight patterns and trends.  
+
+These insights will help us identify which groups we are serving well, where we may need targeted outreach, and how to design recruitment strategies that will bring more students into the program.  
+
+All analyses in this chapter are based on the final analytic dataset (**n = `r n_total_fmt`**).
+
+## 3.1 Geographic Distribution
+
+One of the first questions we want to explore is: **Where are our applicants coming from?**  
+
+Understanding the geographic spread of students can help us:  
+
+- Identify regions that are consistently sending applicants (strong recruitment areas).  
+- Detect underserved regions where we could increase outreach.  
+- Examine whether applicants are concentrated in a few states or broadly distributed.  
+- Compare U.S. vs. international applicants.  
+
+We use the cleaned `home_city`, `home_state`, and `home_zip` variables to summarize locations. For visualization, we include:  
+
+- A **state-level bar chart** showing counts of applicants by state.  
+- A **U.S. map** highlighting geographic concentrations of applicants.  
+- A **table of top cities/ZIP codes** by applicant count.  
+
+### 3.1.1 Top States by Count
+```{r top_state, echo=FALSE, message=FALSE, warning=FALSE}
+# --- State-level counts ---
+state_counts <- apps_core_nodup %>%
+  filter(!is.na(home_state)) %>%
+  count(home_state, sort = TRUE)
+
+# bar chart (top 15 states)
+ggplot(state_counts %>% slice_max(n, n = 15), aes(x = reorder(home_state, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = n), hjust = -0.2, size = 3.5) +  # <-- add counts
+  coord_flip() +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Number of Applicants"
+  ) +
+  theme_minimal()
+```
+
+### 3.1.2 U.S. Map Distribution
+```{r us_map, echo=FALSE, message=FALSE, warning=FALSE}
+# --- U.S. Map ---
+us_states <- map_data("state")
+state_counts_map <- state_counts %>%
+  mutate(region = tolower(state.name[match(home_state, state.abb)]))
+
+ggplot(us_states, aes(long, lat, group = group)) +
+  geom_polygon(fill = "gray90", color = "white") +
+  geom_polygon(
+    data = left_join(us_states, state_counts_map, by = "region"),
+    aes(fill = n),
+    color = "white"
+  ) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", na.value = "gray90") +
+  labs(title = NULL) +
+  coord_fixed(1.3) +    # <-- keeps correct aspect ratio
+  theme_void() +
+  theme(plot.margin = margin(0, 0, 0, 0))   # remove outer padding
+```
+
+### 3.1.3 Top Cities by Count
+```{r top_cities, echo=FALSE, message=FALSE, warning=FALSE}
+# --- Top Cities / ZIP Codes ---
+top_cities <- apps_core_nodup %>%
+  filter(!is.na(home_city)) %>%
+  count(home_city, home_state, sort = TRUE) %>%
+  slice_max(n, n = 15)
+
+datatable(
+  top_cities,
+  options = list(pageLength = 10, scrollX = TRUE),
+  caption = NULL
+)
+```
+
+## 3.2 Demographic Profiles
+
+To better understand the applicant pool, we examine **demographic characteristics** such as:  
+
+- **Gender** distribution  
+- **Race/Ethnicity** composition  
+
+These insights can help us assess:  
+
+- Whether the program is reaching applicants across different groups. 
+- If there are demographic segments that could be targeted more effectively.  
+
+We visualize this data with bar charts and pie charts for clarity.  
+
+### 3.2.1 Gender Distribution
+```{r gender, echo=FALSE, message=FALSE, warning=FALSE}
+gender_counts <- apps_core_nodup %>%
+  mutate(
+    # Normalize input
+    gender_unified = as.character(gender_unified),
+    gender_unified = str_squish(gender_unified),   # trim whitespace
+    gender_unified = str_to_lower(gender_unified), # lowercase everything
+    gender_unified = na_if(gender_unified, ""),    # "" → NA
+    
+    # Collapse categories
+    gender_unified = case_when(
+      gender_unified %in% c("male", "m")   ~ "Male",
+      gender_unified %in% c("female", "f") ~ "Female",
+      TRUE ~ "N/A"
+    )
+  ) %>%
+  count(gender_unified) %>%
+  mutate(
+    pct = n / sum(n),
+    label = paste0(n, " (", percent(pct, accuracy = 1), ")"),
+    gender_unified = factor(gender_unified, levels = c("Male", "Female", "N/A"))
+  )
+
+# custom colors
+pal <- c(
+  "Male"   = "#e6550d",
+  "Female" = "#f77f30",
+  "N/A"    = "gray70"
+)
+
+ggplot(gender_counts,
+       aes(x = reorder(gender_unified, n), y = n, fill = gender_unified)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = label), hjust = -0.2) +
+  scale_fill_manual(values = pal) +
+  coord_flip() +  # horizontal orientation
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Number of Applicants"
+  ) +
+  theme_minimal() +
+  expand_limits(y = max(gender_counts$n) * 1.15)  # extra space for labels
+```
+
+### 3.2.2 Race/Ethnicity Distribution
+```{r race, echo=FALSE, message=FALSE, warning=FALSE}
+# --- Race/Ethnicity distribution ---
+race_counts <- apps_core_nodup %>%
+  mutate(
+    race_ethnicity = case_when(
+      race_ethnicity == "Prefer not to answer" ~ "N/A",
+      TRUE ~ race_ethnicity
+    )
+  ) %>%
+  filter(!is.na(race_ethnicity)) %>%
+  count(race_ethnicity, sort = FALSE) %>%
+  mutate(
+    pct = n / sum(n),
+    # set factor levels (N/A last)
+    race_ethnicity = factor(
+      race_ethnicity,
+      levels = c("Asian", "Black or African American",
+                 "Hispanic or Latino", "White", "N/A")
+    )
+  )
+
+# palette
+pal <- c(
+  "Asian"                   = "#deebf7",
+  "Black or African American" = "#9ecae1",
+  "Hispanic or Latino"      = "#6baed6",
+  "White"                   = "#08519c",
+  "N/A"                     = "gray70"
+)
+
+# legend labels with counts
+legend_labels <- paste0(race_counts$race_ethnicity, " (", race_counts$n, ")")
+names(legend_labels) <- race_counts$race_ethnicity
+
+ggplot(race_counts, aes(x = "", y = n, fill = race_ethnicity)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = percent(pct, accuracy = 1)),
+            position = position_stack(vjust = 0.5), size = 3) +
+  scale_fill_manual(
+    values = pal,
+    labels = legend_labels,
+    breaks = levels(race_counts$race_ethnicity)  # ensures order
+  ) +
+  labs(title = NULL, fill = "Race/Ethnicity") +
+  theme_void() +
+  theme(legend.position = "right")
+```
+
+## 3.3 Academic Profiles  
+
+Beyond demographics, understanding the **academic background** of applicants helps us identify whether the program is reaching the intended student population and where there may be opportunities to expand access.  
+
+Specifically, we examine:  
+
+- **Grade level distribution**: Which grades are most represented? Are we attracting middle school, early high school, or upper high school students?  
+- **Age distribution**: Using reported dates of birth, how old are our applicants at the time of application?  
+- **School type (Public, Private, Charter, Unknown)**: Using NCES matching and keyword heuristics, we classify schools to better understand whether applicants are coming from public or private educational settings.  
+
+This information allows us to evaluate whether the program is effectively engaging its **target age groups** and to detect any over- or under-representation of certain grade levels or school types. 
+
+These insights can directly inform outreach efforts — for example, tailoring recruitment to specific grades or balancing outreach between public and private schools.
+
+### 3.3.1 Grade Distribution
+```{r grade_levels, echo=FALSE, message=FALSE, warning=FALSE}
+# --- Grade Distribution ---
+grade_counts <- apps_core_nodup %>%
+  filter(!is.na(grade)) %>%
+  count(grade, sort = TRUE)
+
+ggplot(grade_counts, aes(x = factor(grade), y = n)) +
+  geom_col(fill = "#f77f30") +
+  geom_text(aes(label = n), vjust = -0.5, size = 3.5) +
+  labs(
+    title = NULL,
+    x = "Grade Level",
+    y = "Number of Applicants"
+  ) +
+  theme_minimal()
+```
+
+### 3.3.2 Age Distribution (10-25 yrs)
+```{r ages, echo=FALSE, message=FALSE, warning=FALSE}
+# --- Age Distribution (filter outliers: 10–25 years) ---
+# calculate age at time of application (approx using current year - birth year)
+apps_age <- apps_core_nodup %>%
+  filter(!is.na(date_of_birth)) %>%
+  mutate(age = lubridate::year(Sys.Date()) - lubridate::year(date_of_birth)) %>%
+  filter(age >= 10 & age <= 25)   # keep only reasonable ages
+
+ggplot(apps_age, aes(x = age)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  geom_text(
+    stat = "bin", binwidth = 1, aes(label = ..count..),
+    vjust = -0.5, color = "black", size = 3.5
+  ) +
+  labs(
+    title = NULL,
+    x = "Age (years)",
+    y = "Number of Applicants"
+  ) +
+  theme_minimal()
+```
+
+### 3.3.3 School Type Distribution
+
+```{r schools, echo=FALSE, message=FALSE, warning=FALSE}
+# Recode, fix factor order, count
+school_type_counts <- apps_core_nodup %>%
+  mutate(
+    school_type = ifelse(school_type == "N/A", "N/A", school_type),
+    school_type = factor(school_type, levels = c("Public","Private","Charter","N/A"))
+  ) %>%
+  count(school_type) %>%
+  mutate(
+    frac = n / sum(n),
+    lab  = percent(frac, accuracy = 1),
+    # Add counts into labels for legend
+    school_type_lab = paste0(school_type, " (", n, ")")
+  )
+
+pal <- c(
+  "Charter" = "#fdae6b",
+  "Private" = "#f77f30",
+  "Public"  = "#e6550d",
+  "N/A"     = "gray70"
+)
+
+ggplot(school_type_counts,
+       aes(x = 2, y = frac, fill = school_type)) +   # <- use original school_type for colors
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y", clip = "off") +
+  xlim(0.5, 2.5) +
+  geom_text(aes(label = lab),
+            position = position_stack(vjust = 0.5),
+            size = 3.5) +
+  scale_fill_manual(
+    values = pal,
+    labels = school_type_counts$school_type_lab,   # <- legend shows counts
+    breaks = school_type_counts$school_type        # <- map colors to original
+  ) +
+  labs(title = NULL, x = NULL, y = NULL, fill = "School Type") +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.margin = margin(5.5, 20, 5.5, 5.5))
+
+```
+
+## 3.4 Socioeconomic Status (SES)
+
+Socioeconomic background can significantly influence program participation and access to enrichment opportunities.
+
+Because individual household income data were not collected from applicants, we estimated SES using U.S. Census Bureau **ACS 2018–2022 5-Year Estimates** (Table **B19013: Median Household Income in the Past 12 Months**) at the **ZIP Code Tabulation Area (ZCTA)** level.  
+
+Each applicant’s ZIP code was linked to the **median household income** of their ZCTA. Applicants were then assigned to **income tiers** based on the national distribution of ZIP code medians (not individual household income):
+
+- **Low Income (≤ $53,464)** → bottom 25% of ZIP codes  
+- **Middle Income ($53,464–$85,184)** → 25th–75th percentile ZIP codes  
+- **High Income (≥ $85,184)** → top 25% of ZIP codes  
+- **Unknown** → ZIP code missing or not matched  
+
+These tiers provide a *ZIP-level proxy* for socioeconomic status, offering useful—though indirect—insight into applicants’ likely income backgrounds. This approach highlights whether the program is disproportionately serving students from higher-income communities, or if outreach is reaching a more diverse socioeconomic spectrum.  
+
+
+```{r SES_plot, echo=FALSE}
+# Bar chart of SES distribution with counts and percentages
+apps_core_nodup %>%
+  count(ses_label) %>%
+  mutate(
+    ses_label = factor(
+      ses_label,
+      levels = c("High Income", "Middle Income", "Low Income", "N/A")
+    ),
+    pct = n / sum(n) * 100,                                   # calculate percentage
+    label = paste0(n, " (", round(pct), "%)")    # combine count + percentage
+  ) %>%
+  ggplot(aes(x = ses_label, y = n, fill = ses_label)) +
+  geom_col() +
+  geom_text(aes(label = label), vjust = -0.5) +               # show both count and %
+  scale_fill_manual(
+    values = c(
+      "High Income" = "#08519c",
+      "Middle Income" = "#3182bd",
+      "Low Income" = "#bdd7e7",
+      "N/A" = "gray70"
+    )
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Number of Applicants"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+## 3.5 Program Completion Rates
+
+A central measure of success for the summer program is whether students **complete** the program after registering. By analyzing completion rates, we can identify areas where additional support, mentoring, or outreach may be needed.  
+
+Key questions we aim to answer:  
+
+- What proportion of applicants successfully completed the program?  
+- Are there differences in completion rates across **gender, race/ethnicity, SES, or state**?  
+
+### 3.5.1 Overall Rate
+```{r completion_overall, echo=FALSE}
+apps_core_nodup %>%
+  count(completed_program) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  knitr::kable(caption = NULL)
+```
+
+### 3.5.2 By Gender
+```{r completion_gender, echo=FALSE}
+apps_core_nodup %>%
+  mutate(
+    gender_unified = as.character(gender_unified),
+    gender_unified = str_squish(gender_unified),
+    gender_unified = str_to_lower(gender_unified),
+    gender_unified = na_if(gender_unified, ""),
+    gender_unified = case_when(
+      gender_unified %in% c("male", "m")   ~ "Male",
+      gender_unified %in% c("female", "f") ~ "Female",
+      TRUE ~ "N/A"
+    )
+  ) %>%
+  group_by(gender_unified) %>%
+  summarise(completion_rate = mean(completed_program == "Yes", na.rm = TRUE)) %>%
+  ggplot(aes(
+    x = factor(gender_unified, levels = c("Male", "Female", "N/A")),
+    y = completion_rate,
+    fill = gender_unified
+  )) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(completion_rate, accuracy = 1)), 
+            vjust = -0.5, size = 3.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(
+    values = c(
+      "Male"   = "#e6550d",
+      "Female" = "#f77f30",
+      "N/A"    = "#B3B3B3"
+    )
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Completion Rate"
+  ) +
+  theme_minimal()
+```
+
+### 3.5.3 By Race/Ethnicity
+```{r completion_race, echo=FALSE}
+apps_core_nodup %>%
+  mutate(race_grouped = case_when(
+    str_detect(tolower(race_ethnicity), "asian") ~ "Asian",
+    str_detect(tolower(race_ethnicity), "white") ~ "White",
+    str_detect(tolower(race_ethnicity), "hispanic|latino") ~ "Hispanic/Latino",
+    str_detect(tolower(race_ethnicity), "black|african") ~ "Black/African American",
+    TRUE ~ "N/A"
+  ),
+  # Force factor levels (N/A last)
+  race_grouped = factor(race_grouped, 
+                        levels = c("Asian", 
+                                   "Black/African American", 
+                                   "Hispanic/Latino", 
+                                   "White", 
+                                   "N/A"))
+  ) %>%
+  group_by(race_grouped) %>%
+  summarise(completion_rate = mean(completed_program == "Yes", na.rm = TRUE)) %>%
+  ggplot(aes(x = race_grouped, y = completion_rate, fill = race_grouped)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(completion_rate, accuracy = 1)), 
+            vjust = -0.5, size = 3.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(
+    values = c(
+      "Asian"                  = "#deebf7",
+      "Black/African American" = "#9ecae1",
+      "Hispanic/Latino"        = "#6baed6",
+      "White"                  = "#08519c",
+      "N/A"                    = "gray70"
+    )
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Completion Rate"
+  ) +
+  theme_minimal()
+```
+
+### 3.5.4 By State
+```{r completion_state, echo=FALSE}
+apps_core_nodup %>%
+  filter(!is.na(home_state)) %>%
+  group_by(home_state) %>%
+  summarise(completion_rate = mean(completed_program == "Yes", na.rm = TRUE),
+            n = n()) %>%
+  filter(n >= 5) %>%   # only states with ≥5 applicants
+  ggplot(aes(x = reorder(home_state, completion_rate), 
+             y = completion_rate, 
+             fill = completion_rate)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(completion_rate, accuracy = 1)), 
+            hjust = -0.1, size = 3.5, color = "black") +
+  scale_y_continuous(labels = scales::percent_format(), 
+                      limits = c(0, 1.1)   # extra space beyond 100%
+                     ) +
+  scale_fill_gradientn(
+    colours = c("#fee6ce", "#fdae6b", "#e6550d"),  # light → medium → dark orange
+    values = scales::rescale(c(0, 0.5, 1)),
+    name = "Completion Rate\n(≥5 Applicants)"
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = NULL
+  ) +
+  coord_flip() +
+  theme_minimal()
+```
+
+### 3.5.5 By Socioeconomic Status
+```{r completion_ses, echo=FALSE}
+apps_core_nodup %>%
+  filter(!is.na(ses_label)) %>%
+  group_by(ses_label) %>%
+  summarise(completion_rate = mean(completed_program == "Yes", na.rm = TRUE)) %>%
+  mutate(
+    ses_label = factor(
+      ses_label,
+      levels = c("High Income", "Middle Income", "Low Income", "N/A")
+    )
+  ) %>%
+  ggplot(aes(x = ses_label, y = completion_rate, fill = ses_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(completion_rate, accuracy = 1)), 
+            vjust = -0.5, size = 3.5) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(
+    values = c(
+      "High Income" = "#08519c",
+      "Middle Income" = "#3182bd",
+      "Low Income" = "#bdd7e7",
+      "N/A" = "gray70"
+    )
+  ) + 
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Completion Rate"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+## 3.6 Trend Analysis  
+
+Understanding how applicant/completion numbers and program completion rates change over time helps us evaluate the growth and effectiveness of the STEM program.  
+
+By analyzing year-over-year trends, we can assess:  
+
+- Whether marketing and outreach efforts are increasing applicant volume.  
+- If completion rates are stable, improving, or declining across years.  
+- Whether certain years show anomalies (e.g., spikes or drops) that warrant closer review.  
+
+This analysis provides actionable insight into the **long-term sustainability** and **impact** of the program.  
+
+### 3.6.1 Counts by Year
+
+```{r applicants_by_year, echo=FALSE}
+# --- Applicants vs Completions (Combined Line Chart) ---
+apps_by_year <- apps_core_nodup %>%
+  count(year) %>%
+  mutate(metric = "Applicants")
+
+completions_by_year <- apps_core_nodup %>%
+  filter(completed_program == "Yes") %>%
+  count(year) %>%
+  mutate(metric = "Completions")
+
+trend_data <- bind_rows(apps_by_year, completions_by_year)
+
+ggplot(trend_data, aes(x = year, y = n, color = metric, group = metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = n), vjust = -1, size = 4, show.legend = FALSE) +
+  scale_x_continuous(breaks = unique(trend_data$year)) +
+  expand_limits(y = max(trend_data$n) + 5) +   # leave headroom
+  scale_color_manual(
+    values = c(
+      "Applicants"  = "#3182bd",  # medium blue
+      "Completions" = "#e6550d"   # strong orange
+    )
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Number of Students",
+    color = NULL   # cleaner legend title
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+```
+
+### 3.6.2 Completion Rates by Year
+
+```{r completion_by_year, echo=FALSE}
+# --- Completion Rate by Year (Line Chart) ---
+completion_by_year <- apps_core_nodup %>%
+  filter(!is.na(completed_program)) %>%
+  group_by(year) %>%
+  summarise(
+    completion_rate = mean(completed_program == "Yes", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(completion_by_year, aes(x = year, y = completion_rate)) +
+  geom_line(color = "#3182bd", size = 1.2) +
+  geom_point(color = "#e6550d", size = 3) +
+  geom_text(aes(label = scales::percent(completion_rate, accuracy = 1)),
+            vjust = -1, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+  scale_x_continuous(breaks = unique(apps_core_nodup$year)) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Completion Rate"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# 4. Conclusion
+
+The analyses in Section 3 provide a comprehensive look at applicant demographics, academic background, socioeconomic distribution, and program outcomes. Together, these findings highlight both the program’s strengths and areas for improvement.  
+
+## 4.1 Key Insights  
+
+- **Geographic Reach**: Applicants are concentrated in coastal and southern states, with noticeable gaps in the **Midwest** and parts of the interior U.S. — likely due to limited outreach in those areas.  
+- **Demographics**: The pool remains **predominantly Asian (58%) and male**, while **Black and Hispanic/Latino students** are smaller applicant groups. White students make up about one-quarter of applicants.  
+- **Academic Profile**: Most applicants are in grades **8–11**, clustering around ages 13–16, which aligns with program goals.  
+- **Socioeconomic Status (SES)**: The program is serving a **disproportionately high number of students from high-income ZIP codes (72%)**, with relatively few applicants from low-income communities despite needs-based aid availability.  
+- **Completion Rates**: Overall completion is strong, with the highest rates among **Hispanic/Latino, White, and Not Reported (90–100%)**. **Asian (82%)** and **Black/African American (75%)** are lower, and **males (92%)** complete at higher rates than **females (79%)** or **Not Reported (75%)**.
+
+
+## 4.2 Recommendations  
+
+- **Expand Geographic Advertising**: Increase outreach and digital ad placement in **Midwestern and underrepresented states** to broaden applicant diversity.  
+- **Expand Access**: Strengthen recruitment efforts in **lower-income schools and districts**, and more clearly emphasize **needs-based fee reductions** to reduce financial barriers.  
+- **Broaden Recruitment**: Partner with community organizations and affinity groups to **increase Black and Hispanic/Latino participation**, including mentorship and referral initiatives.  
+- **Leverage Referral & School Channels**: Scale up existing effective strategies (e.g., **teacher networks, flyers, student/mentor ambassador programs**) to maintain growth.  
+- **Improve Data Capture & Matching**: Standardize **school names, ZIP codes, and demographic fields** at registration to improve accuracy of SES and school classification data.  
+- **Monitor Completion Gaps**: Continue tracking completion by **year, SES, gender, and race/ethnicity**, and pilot targeted support for groups with lower retention rates.  
+
+---
